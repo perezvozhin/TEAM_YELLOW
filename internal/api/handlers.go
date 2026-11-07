@@ -59,11 +59,14 @@ func (a *API) createProduct(w http.ResponseWriter, r *http.Request) {
 		Price int64  `json:"price_cents"`
 		Stock int    `json:"stock"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	if strings.TrimSpace(input.SKU) == "" || strings.TrimSpace(input.Name) == "" || input.Price < 0 || input.Stock < 0 {
+	input.SKU = strings.TrimSpace(input.SKU)
+	input.Name = strings.TrimSpace(input.Name)
+	if input.SKU == "" || input.Name == "" || input.Price <= 0 || input.Stock < 0 {
 		writeError(w, http.StatusBadRequest, "invalid_input")
 		return
 	}
@@ -77,8 +80,13 @@ func (a *API) createProduct(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 	var input domain.CreateOrderInput
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	if !validOrderInput(input) {
+		writeError(w, http.StatusBadRequest, "invalid_input")
 		return
 	}
 	order, err := a.store.CreateOrder(r.Context(), input)
@@ -138,4 +146,16 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
+}
+
+func validOrderInput(in domain.CreateOrderInput) bool {
+	if strings.TrimSpace(in.CustomerEmail) == "" || len(in.Items) == 0 {
+		return false
+	}
+	for _, it := range in.Items {
+		if it.ProductID <= 0 || it.Quantity <= 0 {
+			return false
+		}
+	}
+	return true
 }
