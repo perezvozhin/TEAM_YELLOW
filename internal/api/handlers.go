@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hackathon/inventory-order-management/internal/domain"
 	"github.com/hackathon/inventory-order-management/internal/store"
@@ -32,10 +33,29 @@ func (a *API) Routes() http.Handler {
 	return a.requestLog(mux)
 }
 
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func (a *API) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a.logger.Printf("method=%s path=%s", r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			if rec := recover(); rec != nil {
+				a.logger.Printf("panic=%v method=%s path=%s", rec, r.Method, r.URL.Path)
+				writeError(sw, http.StatusInternalServerError, "internal_error")
+			}
+			a.logger.Printf("method=%s path=%s status=%d duration=%s",
+				r.Method, r.URL.Path, sw.status, time.Since(start))
+		}()
+		next.ServeHTTP(sw, r)
 	})
 }
 
@@ -46,7 +66,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 func (a *API) listProducts(w http.ResponseWriter, r *http.Request) {
 	products, err := a.store.ListProducts(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, products)
@@ -59,17 +79,20 @@ func (a *API) createProduct(w http.ResponseWriter, r *http.Request) {
 		Price int64  `json:"price_cents"`
 		Stock int    `json:"stock"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	if strings.TrimSpace(input.SKU) == "" || strings.TrimSpace(input.Name) == "" || input.Price < 0 || input.Stock < 0 {
+	input.SKU = strings.TrimSpace(input.SKU)
+	input.Name = strings.TrimSpace(input.Name)
+	if input.SKU == "" || input.Name == "" || input.Price <= 0 || input.Stock < 0 {
 		writeError(w, http.StatusBadRequest, "invalid_input")
 		return
 	}
 	product, err := a.store.CreateProduct(r.Context(), input.SKU, input.Name, input.Price, input.Stock)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, product)
@@ -77,8 +100,13 @@ func (a *API) createProduct(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 	var input domain.CreateOrderInput
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	if !validOrderInput(input) {
+		writeError(w, http.StatusBadRequest, "invalid_input")
 		return
 	}
 	order, err := a.store.CreateOrder(r.Context(), input)
@@ -90,7 +118,7 @@ func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrInsufficientStock):
 		writeError(w, http.StatusConflict, "insufficient_stock")
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 	default:
 		writeJSON(w, http.StatusCreated, order)
 	}
@@ -108,7 +136,7 @@ func (a *API) getOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, order)
@@ -124,7 +152,7 @@ func (a *API) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "order_not_found")
 		return
 	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -136,6 +164,23 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func (a *API) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	a.logger.Printf("method=%s path=%s error=%v", r.Method, r.URL.Path, err)
+	writeError(w, http.StatusInternalServerError, "internal_error")
+}
+
 func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
+}
+
+func validOrderInput(in domain.CreateOrderInput) bool {
+	if strings.TrimSpace(in.CustomerEmail) == "" || len(in.Items) == 0 {
+		return false
+	}
+	for _, it := range in.Items {
+		if it.ProductID <= 0 || it.Quantity <= 0 {
+			return false
+		}
+	}
+	return true
 }
