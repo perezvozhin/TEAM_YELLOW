@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"io"
 	"log"
 	"net/http"
@@ -30,5 +31,20 @@ func TestBadInputReturns400(t *testing.T) {
 				t.Errorf("got %d, want 400", rec.Code)
 			}
 		})
+	}
+}
+func TestRecoverFromPanic(t *testing.T) {
+	var buf bytes.Buffer
+	a := New(nil, log.New(&buf, "", 0))
+	h := a.requestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("got %d, want 500", rec.Code)
+	}
+	if !strings.Contains(buf.String(), "panic=boom") {
+		t.Errorf("panic was not logged: %q", buf.String())
 	}
 }

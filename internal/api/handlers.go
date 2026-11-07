@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hackathon/inventory-order-management/internal/domain"
 	"github.com/hackathon/inventory-order-management/internal/store"
@@ -32,10 +33,29 @@ func (a *API) Routes() http.Handler {
 	return a.requestLog(mux)
 }
 
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func (a *API) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a.logger.Printf("method=%s path=%s", r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			if rec := recover(); rec != nil {
+				a.logger.Printf("panic=%v method=%s path=%s", rec, r.Method, r.URL.Path)
+				writeError(sw, http.StatusInternalServerError, "internal_error")
+			}
+			a.logger.Printf("method=%s path=%s status=%d duration=%s",
+				r.Method, r.URL.Path, sw.status, time.Since(start))
+		}()
+		next.ServeHTTP(sw, r)
 	})
 }
 
