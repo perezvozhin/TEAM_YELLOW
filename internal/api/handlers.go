@@ -46,7 +46,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 func (a *API) listProducts(w http.ResponseWriter, r *http.Request) {
 	products, err := a.store.ListProducts(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, products)
@@ -72,7 +72,7 @@ func (a *API) createProduct(w http.ResponseWriter, r *http.Request) {
 	}
 	product, err := a.store.CreateProduct(r.Context(), input.SKU, input.Name, input.Price, input.Stock)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, product)
@@ -98,7 +98,7 @@ func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrInsufficientStock):
 		writeError(w, http.StatusConflict, "insufficient_stock")
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 	default:
 		writeJSON(w, http.StatusCreated, order)
 	}
@@ -116,7 +116,7 @@ func (a *API) getOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, order)
@@ -132,7 +132,7 @@ func (a *API) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "order_not_found")
 		return
 	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		a.internalError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -142,6 +142,11 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func (a *API) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	a.logger.Printf("method=%s path=%s error=%v", r.Method, r.URL.Path, err)
+	writeError(w, http.StatusInternalServerError, "internal_error")
 }
 
 func writeError(w http.ResponseWriter, status int, code string) {
