@@ -17,16 +17,16 @@ type OrderItemInput struct {
 }
 
 type CreateOrderInput struct {
-	CustomerEmail string          `json:"customer_email"`
+	CustomerEmail string           `json:"customer_email"`
 	Items         []OrderItemInput `json:"items"`
 }
 
 type Order struct {
-	ID            int64     `json:"id"`
-	CustomerEmail string    `json:"customer_email"`
-	Status        string    `json:"status"`
-	Total         int64     `json:"total_cents"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            int64       `json:"id"`
+	CustomerEmail string      `json:"customer_email"`
+	Status        string      `json:"status"`
+	Total         int64       `json:"total_cents"`
+	CreatedAt     time.Time   `json:"created_at"`
 	Items         []OrderItem `json:"items,omitempty"`
 }
 

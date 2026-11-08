@@ -1,5 +1,7 @@
 .PHONY: run test race vet fmt migrate-up migrate-down
 
+PSQL = docker compose exec -T postgres psql -X -U postgres -d inventory -v ON_ERROR_STOP=1 --single-transaction
+
 run:
 	go run ./cmd/api
 
@@ -13,10 +15,10 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w ./cmd
+	gofmt -w ./cmd ./internal
 
 migrate-up:
-	docker compose exec -T postgres psql -U postgres -d inventory < migrations/001_init.up.sql
+	$(PSQL) -f /migrations/001_init.up.sql -f /migrations/002_constraints.up.sql
 
 migrate-down:
-	docker compose exec -T postgres psql -U postgres -d inventory < migrations/001_init.down.sql
+	$(PSQL) -f /migrations/002_constraints.down.sql -f /migrations/001_init.down.sql

@@ -3,6 +3,10 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
+	"net/mail"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,6 +17,7 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrInsufficientStock = errors.New("insufficient stock")
 var ErrInvalidInput = errors.New("invalid input")
+var ErrDuplicateSKU = errors.New("duplicate SKU")
 
 type Store struct {
 	db *pgxpool.Pool
@@ -23,12 +28,22 @@ func New(db *pgxpool.Pool) *Store {
 }
 
 func (s *Store) CreateProduct(ctx context.Context, sku, name string, price int64, stock int) (domain.Product, error) {
+	if strings.TrimSpace(sku) == "" || strings.TrimSpace(name) == "" ||
+		strings.ContainsRune(sku, 0) || strings.ContainsRune(name, 0) ||
+		price <= 0 || stock < 0 || stock > math.MaxInt32 {
+		return domain.Product{}, ErrInvalidInput
+	}
+
 	var p domain.Product
 	err := s.db.QueryRow(ctx, `
 		INSERT INTO products (sku, name, price_cents, stock)
 		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (sku) DO NOTHING
 		RETURNING id, sku, name, price_cents, stock, created_at
 	`, sku, name, price, stock).Scan(&p.ID, &p.SKU, &p.Name, &p.Price, &p.Stock, &p.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Product{}, ErrDuplicateSKU
+	}
 	return p, err
 }
 
@@ -53,74 +68,87 @@ func (s *Store) ListProducts(ctx context.Context) ([]domain.Product, error) {
 	return products, rows.Err()
 }
 
-
 func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) (domain.Order, error) {
-	if input.CustomerEmail == "" || len(input.Items) == 0 {
+	email := strings.TrimSpace(input.CustomerEmail)
+	address, err := mail.ParseAddress(email)
+	if err != nil || address.Address != email || len(input.Items) == 0 {
 		return domain.Order{}, ErrInvalidInput
 	}
 
-	order, err := s.db.Exec(ctx, `
-		INSERT INTO orders (customer_email, status, total_cents)
-		VALUES ($1, 'created', 0)
-	`, input.CustomerEmail)
-	_ = order
-	if err != nil {
-		return domain.Order{}, err
-	}
-
-	var result domain.Order
-	err = s.db.QueryRow(ctx, `
-		SELECT id, customer_email, status, total_cents, created_at
-		FROM orders WHERE customer_email = $1
-		ORDER BY id DESC LIMIT 1
-	`, input.CustomerEmail).Scan(&result.ID, &result.CustomerEmail, &result.Status, &result.Total, &result.CreatedAt)
-	if err != nil {
-		return domain.Order{}, err
-	}
-
-	var total int64
+	quantities := make(map[int64]int64)
+	var productIDs []int64
 	for _, item := range input.Items {
-		if item.Quantity <= 0 {
+		if item.ProductID <= 0 || item.Quantity <= 0 || item.Quantity > math.MaxInt32 {
 			return domain.Order{}, ErrInvalidInput
 		}
+		if quantities[item.ProductID] == 0 {
+			productIDs = append(productIDs, item.ProductID)
+		}
+		quantities[item.ProductID] += int64(item.Quantity)
+	}
+	// Take product locks in the same order in creation and cancellation.
+	slices.Sort(productIDs)
 
-		var name string
-		var price int64
-		var stock int
-		err := s.db.QueryRow(ctx, `
-			SELECT name, price_cents, stock FROM products WHERE id = $1
-		`, item.ProductID).Scan(&name, &price, &stock)
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return domain.Order{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	products := make(map[int64]domain.Product, len(productIDs))
+	var total int64
+	for _, id := range productIDs {
+		var product domain.Product
+		err := tx.QueryRow(ctx, `
+			SELECT name, price_cents, stock FROM products WHERE id = $1 FOR NO KEY UPDATE
+		`, id).Scan(&product.Name, &product.Price, &product.Stock)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Order{}, ErrNotFound
 		}
 		if err != nil {
 			return domain.Order{}, err
 		}
-		if stock < item.Quantity {
+		quantity := quantities[id]
+		if int64(product.Stock) < quantity {
 			return domain.Order{}, ErrInsufficientStock
 		}
-
-		_, err = s.db.Exec(ctx, `UPDATE products SET stock = $1 WHERE id = $2`,
-			stock-item.Quantity, item.ProductID)
-		if err != nil {
-			return domain.Order{}, err
+		if product.Price > (math.MaxInt64-total)/quantity {
+			return domain.Order{}, ErrInvalidInput
 		}
-
-		_, err = s.db.Exec(ctx, `
-			INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price_cents)
-			VALUES ($1, $2, $3, $4, $5)
-		`, result.ID, item.ProductID, name, item.Quantity, price)
-		if err != nil {
-			return domain.Order{}, err
-		}
-		total += price * int64(item.Quantity)
+		total += product.Price * quantity
+		products[id] = product
 	}
 
-	_, err = s.db.Exec(ctx, `UPDATE orders SET total_cents = $1 WHERE id = $2`, total, result.ID)
+	for _, id := range productIDs {
+		if _, err := tx.Exec(ctx, `UPDATE products SET stock = stock - $1 WHERE id = $2`, quantities[id], id); err != nil {
+			return domain.Order{}, err
+		}
+	}
+
+	var result domain.Order
+	err = tx.QueryRow(ctx, `
+		INSERT INTO orders (customer_email, status, total_cents)
+		VALUES ($1, 'created', $2)
+		RETURNING id, customer_email, status, total_cents, created_at
+	`, email, total).Scan(&result.ID, &result.CustomerEmail, &result.Status, &result.Total, &result.CreatedAt)
 	if err != nil {
 		return domain.Order{}, err
 	}
-	result.Total = total
+
+	for _, item := range input.Items {
+		product := products[item.ProductID]
+		_, err = tx.Exec(ctx, `
+			INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price_cents)
+			VALUES ($1, $2, $3, $4, $5)
+		`, result.ID, item.ProductID, product.Name, item.Quantity, product.Price)
+		if err != nil {
+			return domain.Order{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Order{}, err
+	}
 	return result, nil
 }
 
@@ -156,8 +184,14 @@ func (s *Store) GetOrder(ctx context.Context, id int64) (domain.Order, error) {
 }
 
 func (s *Store) CancelOrder(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
 	var status string
-	err := s.db.QueryRow(ctx, `SELECT status FROM orders WHERE id = $1`, id).Scan(&status)
+	err = tx.QueryRow(ctx, `SELECT status FROM orders WHERE id = $1 FOR NO KEY UPDATE`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -168,32 +202,40 @@ func (s *Store) CancelOrder(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	rows, err := s.db.Query(ctx, `
-		SELECT product_id, quantity FROM order_items WHERE order_id = $1
+	rows, err := tx.Query(ctx, `
+		SELECT product_id, SUM(quantity) FROM order_items WHERE order_id = $1
+		GROUP BY product_id ORDER BY product_id
 	`, id)
 	if err != nil {
 		return err
 	}
-	type line struct { productID int64; quantity int }
+	defer rows.Close()
+	type line struct {
+		productID int64
+		quantity  int64
+	}
 	var lines []line
 	for rows.Next() {
 		var l line
 		if err := rows.Scan(&l.productID, &l.quantity); err != nil {
-			rows.Close()
 			return err
 		}
 		lines = append(lines, l)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	for _, l := range lines {
-		_, err := s.db.Exec(ctx, `
+		_, err := tx.Exec(ctx, `
 			UPDATE products SET stock = stock + $1 WHERE id = $2
 		`, l.quantity, l.productID)
 		if err != nil {
 			return err
 		}
 	}
-	_, err = s.db.Exec(ctx, `UPDATE orders SET status = 'cancelled' WHERE id = $1`, id)
-	return err
+	if _, err := tx.Exec(ctx, `UPDATE orders SET status = 'cancelled' WHERE id = $1`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
